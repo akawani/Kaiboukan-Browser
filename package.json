@@ -1,0 +1,43 @@
+{
+  "name": "kaiboukan-browser",
+  "version": "1.0.4",
+  "description": "Kaiboukan Browser",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64",
+    "build:portable": "electron-builder --win --x64 --dir"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.akawani.browser.Kaiboukan",
+    "productName": "Kaiboukan Browser",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "dir"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "files": [
+      "main.js",
+      "package.json"
+    ]
+  },
+  "dependencies": {
+    "electron-store": "^11.0.2",
+    "iconv-lite": "^0.7.0"
+  }
+}
