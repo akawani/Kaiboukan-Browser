@@ -1,16 +1,11 @@
 // マウスガード検証テスト
-// main.jsからMOUSEGUARD_CODEを抽出し、スタブページで「何が届く/届かない」を実測する
+// mouseguard.js（スクリプト本体）をスタブページで実行し「何が届く/届かない」を実測する
 const { app, BrowserWindow } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
-const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-
-const msMatch = src.match(/const MOUSEGUARD_MS = (\d+);/);
-const codeMatch = src.match(/const MOUSEGUARD_CODE = `([\s\S]*?)`;/);
-if (!msMatch || !codeMatch) { console.log('EXTRACT_FAIL'); app.exit(1); }
-const GUARD_MS = parseInt(msMatch[1], 10);
-const GUARD = codeMatch[1].split('${MOUSEGUARD_MS}').join(String(GUARD_MS));
+const GUARD = fs.readFileSync(path.join(__dirname, '..', 'mouseguard.js'), 'utf8');
+const GUARD_MS = 1000; // ※ mouseguard.js 内の値と同期させること
 
 const PAGE = `<!doctype html><html><head></head><body style="margin:0">
 <div id="target" style="width:400px;height:400px;background:#eee"></div>

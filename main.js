@@ -1,33 +1,23 @@
-const { app, BrowserWindow, Menu, powerMonitor } = require('electron');
-const iconv = require('iconv-lite');
+const { app, BrowserWindow, Menu, powerMonitor, ipcMain } = require('electron');
+const path = require('path');
+const fs = require('fs');
 
 let Store; // グローバルに宣言
 let store;
 
-// console.logをShift_JIS対応版にオーバーライド
-const originalLog = console.log;
-const originalWarn = console.warn;
-const originalError = console.error;
-
-console.log = function(...args) {
-  const message = args.map(arg => String(arg)).join(' ');
-  const buffer = iconv.encode(message + '\n', 'Shift_JIS');
-  process.stdout.write(buffer);
-};
-
-console.warn = function(...args) {
-  const message = args.map(arg => String(arg)).join(' ');
-  const buffer = iconv.encode('[WARN] ' + message + '\n', 'Shift_JIS');
-  process.stdout.write(buffer);
-};
-
-console.error = function(...args) {
-  const message = args.map(arg => String(arg)).join(' ');
-  const buffer = iconv.encode('[ERROR] ' + message + '\n', 'Shift_JIS');
-  process.stderr.write(buffer);
-};
+// （廃止: Shift_JISオーバーライド → 出力をUTF-8に統一。ターミナル側もUTF-8で
+//   表示すること。Windows Terminalなら既定で正しく表示されます）
 
 const TARGET_URL = 'https://play.games.dmm.com/game/kancolle';
+
+// 艦これ本体はクロスオリジンiframe（osapi.dmm.com/gadgets…）で動く（実機プローブで確認）。
+// 実測: 注入先をそのURLマッチフレームに絞っていたが、実操作のポインターイベントは
+// その文書を通らない（＝実キャンバスは入れ子のさらに深い子フレームにある＝DOMイベントは
+// documentsを跨がない）。よってルート以外の全フレームに注入する。スクリプトはすべて冪等。
+const INJECT_SCRIPTS = ['focusSpoof', 'touchHover', 'inputPolicy'];
+
+// レンダラーログをターミナルに流す（touchhoverの動作ログ＝実機構観察のため。UTF-8出力）。
+app.commandLine.appendSwitch('enable-logging', 'stderr');
 
 const BOOKMARKLET_CODE = `
 (($, _) => {
@@ -131,42 +121,67 @@ const BOOKMARKLET_CODE = `
 // 放置復帰時のマウスガード: レジューム/ロック解除時にシステムが合成する
 // 「ホバー系」マウスイベント（勝手にフォーカスが当たる原因）のみ短时间遮断する。
 // クリック・ボタン押下は明示的なマウス操作なので対象外。タッチ操作も許容する。
-const MOUSEGUARD_MS = 1000;
-const MOUSEGUARD_CODE = `
-(function() {
-  if (typeof window.__kbMouseGuardCleanup === 'function') {
-    window.__kbMouseGuardCleanup();
+// ※スクリプト本体は mouseguard.js（テストハーネスが同ファイルを読む。1000ms埋め込み）
+const MOUSEGUARD_MS = 1000; // ※ mouseguard.js 内の値と同期させること
+const MOUSEGUARD_CODE = fs.readFileSync(path.join(__dirname, 'mouseguard.js'), 'utf8');
+
+// タッチ操作時のホバー抑止（常設、v2）: スクリプト本体は touchhover.js。
+//   実マウス運用（カーソル表示あり）のホバーは许容。タッチ運用（カーソル非表示状態）では
+//   ホバーを由来を問わず抑止し、実マウス→タッチの切り替え時とタッチ操作終了時に
+//   古いホバー状態（当たり判定）を out/leave 合成で解除する。操作そのものは许容。
+const TOUCHHOVER_CODE = fs.readFileSync(path.join(__dirname, 'touchhover.js'), 'utf8');
+
+// ゲームフレーム注入用スクリプト内容（単一の源＝ファイル。focus-spoofはトップフレームには
+// プリロードとして読み込まれる）。スクリプトはすべて冪等（再適用=自前クリーンアップ）。
+const SCRIPT_CONTENTS = {
+  focusSpoof: fs.readFileSync(path.join(__dirname, 'focus-spoof.js'), 'utf8'),
+  touchHover: TOUCHHOVER_CODE,
+  inputPolicy: fs.readFileSync(path.join(__dirname, 'input-policy.js'), 'utf8'),
+  mouseGuard: MOUSEGUARD_CODE,
+};
+
+// フレームツリー全体（E28-safe: frame.frames の再帰。framesInSubtree は v30+ で存在しない）
+function walkFrames(root) {
+  const out = [root];
+  const kids = root.frames || [];
+  for (const k of kids) {
+    out.push(...walkFrames(k));
   }
-  var HOVER_TYPES = ['pointermove', 'pointerover', 'pointerenter', 'pointerleave', 'pointerout',
-                     'mousemove', 'mouseover', 'mouseenter', 'mouseleave', 'mouseout'];
-  function isMouseOrigin(e) {
-    // pointerTypeが分かるものはmouse由来だけ遮断（touch/stylus=明示操作なので许容）
-    if (e.pointerType !== undefined) {
-      return e.pointerType === 'mouse';
+  return out;
+}
+
+// ルート以外の全フレームに注入（ルートは既存の実行経路が既にカバー済み。
+//  子フレームはDOMイベントが文書を跨がないため、ここに注入しなければイベントが見えない）。
+//  実行自体は再走させても安全（スクリプト冪等）。ログはフレームごとに初回のみ。
+const injectedLogged = new Set();
+let noChildLogged = false;
+function injectIntoGameFrames(win) {
+  if (isExiting || win.isDestroyed()) {
+    return;
+  }
+  try {
+    const frames = walkFrames(win.webContents.mainFrame).slice(1);
+    if (frames.length === 0) {
+      if (!noChildLogged) {
+        noChildLogged = true;
+        console.log('子フレーム未検出（ルートのみ）');
+      }
+      return;
     }
-    // MouseEventsはガード期間中は復帰時のノイズ扱い
-    return true;
-  }
-  function guardHandler(e) {
-    if (!isMouseOrigin(e)) return;
-    e.stopImmediatePropagation();
-    if (e.cancelable) {
-      e.preventDefault();
+    for (const f of frames) {
+      const short = (f.url || '(URL未確定)').split('#')[0].slice(0, 100);
+      if (!injectedLogged.has(short)) {
+        injectedLogged.add(short);
+        console.log('フレーム検出（初回）→ 注入: ' + INJECT_SCRIPTS.join(',') + ' @ ' + short);
+      }
+      for (const key of INJECT_SCRIPTS) {
+        f.executeJavaScript(SCRIPT_CONTENTS[key]).catch(() => {});
+      }
     }
+  } catch (e) {
+    console.error('フレームスキャンエラー:', e);
   }
-  function cleanup() {
-    for (var i = 0; i < HOVER_TYPES.length; i++) {
-      document.removeEventListener(HOVER_TYPES[i], guardHandler, true);
-    }
-    window.__kbMouseGuardCleanup = null;
-  }
-  window.__kbMouseGuardCleanup = cleanup;
-  for (var i = 0; i < HOVER_TYPES.length; i++) {
-    document.addEventListener(HOVER_TYPES[i], guardHandler, true);
-  }
-  setTimeout(cleanup, ${MOUSEGUARD_MS});
-})();
-`;
+}
 
 let escPressTime = null;
 const ESC_TIMEOUT = 5000;
@@ -198,13 +213,25 @@ function createWindow() {
     autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: false,
-      contextIsolation: true,
+      // フォーカスspoof（focus-spoof.js）はメインワールドでページスクリプトより先に走る必要があるため
+      // contextIsolation は false（このアプリにcontextBridge利用箇所はない）
+      contextIsolation: false,
+      preload: path.join(__dirname, 'focus-spoof.js'),
       webviewTag: false,
       devTools: true
     }
   });
 
   mainWindow = win;
+
+  // コンソール中継: sandboxワールドではプレロードと注入スクリプトのグローバルが共有できない
+  // ため、ワールド側の要求はコンソールが唯一確実に跨れる経路（機構そのもの・silent）。
+  // 動作の証左は trustedHoverClear 側が実行時（またはエラー時）に1行だけ出す。
+  win.webContents.on('console-message', (event, level, message) => {
+    if (typeof message === 'string' && message.indexOf('[KB-REQ]') === 0) {
+      trustedHoverClear();
+    }
+  });
 
   if (process.env.NODE_ENV === 'development') {
     win.webContents.openDevTools();
@@ -245,14 +272,21 @@ function createWindow() {
 
     disableTouchKeyboard(win);
 
+    applyTouchHoverFilter(win);
+
+    // ゲーム本体ワールド（クロスオリジンiframe）にも同一スクリプトを注入
+    injectIntoGameFrames(win);
+
     setTimeout(() => {
       console.log('起動後3秒経過 - ブックマークレット実行');
       executeBookmarklet(win);
+      injectIntoGameFrames(win);
     }, 3000);
 
     setTimeout(() => {
       console.log('起動後10秒経過 - ブックマークレット実行');
       executeBookmarklet(win);
+      injectIntoGameFrames(win);
     }, 10000);
 
     showFullscreenHint(win);
@@ -263,6 +297,15 @@ function createWindow() {
     executeBookmarklet(win);
   }, 60000);
 
+  // ゲームフレーム（艦これ本体ワールド）が後から生成・导航された場合の取りこぼし防止
+  // （frame-created は v30+。E28では did-frame-navigate が実働のフック）
+  win.webContents.on('frame-created', () => {
+    setTimeout(() => injectIntoGameFrames(win), 3000);
+  });
+  win.webContents.on('did-frame-navigate', () => {
+    //  navigation 確定直後のフレームはURLが確定していない場合があるため少し待つ
+    setTimeout(() => injectIntoGameFrames(win), 500);
+  });
   win.webContents.on('before-input-event', (event, input) => {
     if (input.type === 'keyDown') {
 
@@ -613,126 +656,7 @@ function executeBookmarklet(win) {
 }
 
 function disableTouchKeyboard(win) {
-  const disableCode = `
-    (function() {
-      // タッチキーボード完全抑止関数
-      function preventTouchKeyboard(element) {
-        if (!element) return;
-
-        // 1. readonly属性を恒久的に設定
-        element.setAttribute('readonly', 'readonly');
-
-        // 2. inputmodeをnoneに固定
-        element.setAttribute('inputmode', 'none');
-
-        // 3. フォーカスを即座に解除
-        element.addEventListener('focus', function(e) {
-          e.preventDefault();
-          element.blur();
-        }, { capture: true });
-
-        // 4. タッチイベントでフォーカスさせない
-        element.addEventListener('touchstart', function(e) {
-          e.preventDefault();
-        }, { passive: false });
-
-        element.addEventListener('touchend', function(e) {
-          e.preventDefault();
-          element.blur();
-        }, { passive: false });
-
-        // 5. クリックイベントも抑止
-        element.addEventListener('click', function(e) {
-          e.preventDefault();
-          element.blur();
-        });
-
-        // 6. ポインターイベントも抑止
-        element.addEventListener('pointerdown', function(e) {
-          e.preventDefault();
-          element.blur();
-        }, { passive: false });
-
-        // 7. マウスイベントも念のため抑止
-        element.addEventListener('mousedown', function(e) {
-          e.preventDefault();
-          element.blur();
-        }, { passive: false });
-      }
-
-      // 既存の全input/textareaに適用
-      const inputs = document.querySelectorAll('input, textarea');
-      inputs.forEach(preventTouchKeyboard);
-
-      // 動的に追加される要素を監視
-      const observer = new MutationObserver(function(mutations) {
-        mutations.forEach(function(mutation) {
-          mutation.addedNodes.forEach(function(node) {
-            if (node.nodeType === 1) {
-              if (node.matches('input, textarea')) {
-                preventTouchKeyboard(node);
-              }
-              const nestedInputs = node.querySelectorAll('input, textarea');
-              nestedInputs.forEach(preventTouchKeyboard);
-            }
-          });
-        });
-      });
-
-      observer.observe(document.body, {
-        childList: true,
-        subtree: true
-      });
-
-      // iframe内のコンテンツにも適用
-      function applyToIframes() {
-        const iframes = document.querySelectorAll('iframe');
-        iframes.forEach(function(iframe) {
-          try {
-            const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-            if (iframeDoc) {
-              const iframeInputs = iframeDoc.querySelectorAll('input, textarea');
-              iframeInputs.forEach(preventTouchKeyboard);
-
-              const iframeObserver = new MutationObserver(function(mutations) {
-                mutations.forEach(function(mutation) {
-                  mutation.addedNodes.forEach(function(node) {
-                    if (node.nodeType === 1) {
-                      if (node.matches('input, textarea')) {
-                        preventTouchKeyboard(node);
-                      }
-                      const nestedInputs = node.querySelectorAll('input, textarea');
-                      nestedInputs.forEach(preventTouchKeyboard);
-                    }
-                  });
-                });
-              });
-
-              iframeObserver.observe(iframeDoc.body, {
-                childList: true,
-                subtree: true
-              });
-            }
-          } catch (e) {
-            // クロスオリジンの場合はスキップ
-          }
-        });
-      }
-
-      applyToIframes();
-
-      const iframeObserver = new MutationObserver(function() {
-        applyToIframes();
-      });
-
-      iframeObserver.observe(document.body, {
-        childList: true,
-        subtree: true
-      });
-
-      console.log('タッチキーボード完全抑止機能を適用しました');
-    })();
-  `;
+  const disableCode = fs.readFileSync(path.join(__dirname, 'input-policy.js'), 'utf8');
 
   win.webContents.executeJavaScript(disableCode)
     .then(() => {
@@ -743,6 +667,16 @@ function disableTouchKeyboard(win) {
     });
 }
 
+// ページ読み込みごとにタッチホバー抑止フィルタを適用する（常設）
+function applyTouchHoverFilter(win) {
+  if (isExiting || win.isDestroyed()) {
+    return;
+  }
+
+  console.log('タッチホバー抑止（遮断＋ホバー解除）適用');
+  win.webContents.executeJavaScript(TOUCHHOVER_CODE).catch(() => {});
+}
+
 // 放置復帰/ロック解除時にページへマウスガードを発動する
 function applyMouseGuard(trigger) {
   if (isExiting || !mainWindow || mainWindow.isDestroyed()) {
@@ -751,6 +685,55 @@ function applyMouseGuard(trigger) {
 
   console.log(trigger + ' - マウスガード発動（' + MOUSEGUARD_MS + 'ms間ホバー系イベント遮断）');
   mainWindow.webContents.executeJavaScript(MOUSEGUARD_CODE).catch(() => {});
+  // 実操作の起きる文書（入れ子フレーム）にも（スクリプトは冪等）
+  try {
+    for (const f of walkFrames(mainWindow.webContents.mainFrame).slice(1)) {
+      console.log(trigger + ' - マウスガード発動（フレーム @ ' + (f.url || '').split('#')[0].slice(0, 100) + '）');
+      f.executeJavaScript(MOUSEGUARD_CODE).catch(() => {});
+    }
+  } catch (e) {}
+}
+
+// —— CDP（trusted入力）によるホバー解除実行 ——
+// 実測: ワールド側の判定・要求は実機で動く（[KB]ログで確認）が、JS合成イベントでは
+// ゲームは反応しない（trusted入力しか聞かない）。よって要求hereを受けて、
+// CDPで「本物のマウス移動」を「何もない所」（ゲーム領域内の左上＝ステージ背景）に打つ。
+const cdp = { attached: false, lastAt: 0 };
+async function trustedHoverClear() {
+  if (!mainWindow || mainWindow.isDestroyed() || isExiting) {
+    return;
+  }
+  const now = Date.now();
+  if (now - cdp.lastAt < 300) {
+    return; // 要求の連続受信へのスロットル
+  }
+  cdp.lastAt = now;
+  try {
+    if (!cdp.attached) {
+      // attach()の引数はプロトコルバージョン（'1.3'）。識別子ではない（以前の不具合）
+      mainWindow.webContents.debugger.attach('1.3');
+      cdp.attached = true;
+    }
+    // ゲーム領域（#game_frame＝ブックマークレットの操作対象）の画面上矩形
+    const rect = await mainWindow.webContents.executeJavaScript(
+      "(() => { const g = document.getElementById('game_frame'); if (!g) return null;" +
+      " const r = g.getBoundingClientRect(); return { left: r.left, top: r.top, w: r.width, h: r.height }; })()");
+    let x, y;
+    if (rect && rect.w > 100) {
+      x = Math.round(rect.left + 4);
+      y = Math.round(rect.top + 4);
+    } else {
+      const b = mainWindow.getContentBounds();
+      x = Math.round(b.width / 2);
+      y = 4; // フォールバック: ウィンドウ上端（ゲーム外の何もない所）
+    }
+    await mainWindow.webContents.debugger.sendCommand('Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x, y, buttons: 0
+    });
+    console.log('CDPホバー解除実行: trusted mouseMoved @ ' + x + ',' + y);
+  } catch (e) {
+    console.error('CDPホバー解除エラー:', e.message || e);
+  }
 }
 
 // ★修正: dynamic importを使用
@@ -759,6 +742,12 @@ app.whenReady().then(async () => {
   const module = await import('electron-store');
   Store = module.default;
   store = new Store();
+
+  // ワールド側スクリプト（touchhover）からのホバー解除要求（プレロードと同じ世界の経路用。
+  // 実際のアプリ構成では世界の壁があるため、コンソール中継（console-message）が主経路）
+  ipcMain.on('kb-hover-clear', () => {
+    trustedHoverClear();
+  });
 
   createWindow();
 
