@@ -211,6 +211,8 @@ function createWindow() {
     fullscreen: store.get('wasFullscreen', true),
     skipTaskbar: false,
     autoHideMenuBar: true,
+    // 未描画領域（OS角丸マスクの欠け・リサイズ直後等）を白にしない（黒で塗る）
+    backgroundColor: '#000000',
     webPreferences: {
       nodeIntegration: false,
       // フォーカスspoof（focus-spoof.js）はメインワールドでページスクリプトより先に走る必要があるため
