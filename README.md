@@ -3,6 +3,8 @@
 
 # Kaiboukan Browser
 
+![Kaiboukan Browser](assets/screenshot.png)
+
 **バージョン**: 1.0.5
 
 ---
