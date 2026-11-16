@@ -14,7 +14,7 @@ const TARGET_URL = 'https://play.games.dmm.com/game/kancolle';
 // 実測: 注入先をそのURLマッチフレームに絞っていたが、実操作のポインターイベントは
 // その文書を通らない（＝実キャンバスは入れ子のさらに深い子フレームにある＝DOMイベントは
 // documentsを跨がない）。よってルート以外の全フレームに注入する。スクリプトはすべて冪等。
-const INJECT_SCRIPTS = ['focusSpoof', 'touchHover', 'inputPolicy'];
+const INJECT_SCRIPTS = ['focusSpoof', 'touchHover', 'inputPolicy', 'darkBg'];
 
 // レンダラーログをターミナルに流す（touchhoverの動作ログ＝実機構観察のため。UTF-8出力）。
 app.commandLine.appendSwitch('enable-logging', 'stderr');
@@ -138,6 +138,7 @@ const SCRIPT_CONTENTS = {
   touchHover: TOUCHHOVER_CODE,
   inputPolicy: fs.readFileSync(path.join(__dirname, 'input-policy.js'), 'utf8'),
   mouseGuard: MOUSEGUARD_CODE,
+  darkBg: fs.readFileSync(path.join(__dirname, 'dark-bg.js'), 'utf8'),
 };
 
 // フレームツリー全体（E28-safe: frame.frames の再帰。framesInSubtree は v30+ で存在しない）

@@ -37,6 +37,7 @@
       "touchhover.js",
       "input-policy.js",
       "mouseguard.js",
+      "dark-bg.js",
       "package.json"
     ]
   },
